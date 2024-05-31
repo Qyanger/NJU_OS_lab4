@@ -8,6 +8,7 @@
 #define SYS_SLEEP 4
 #define SYS_EXIT 5
 #define SYS_SEM 6
+#define SYS_PID 7
 
 #define STD_OUT 0
 #define STD_IN 1
@@ -44,6 +45,7 @@ void syscallExec(struct StackFrame *sf);
 void syscallSleep(struct StackFrame *sf);
 void syscallExit(struct StackFrame *sf);
 void syscallSem(struct StackFrame *sf);
+void syscallPid(struct StackFrame *sf);
 
 void syscallWriteStdOut(struct StackFrame *sf);
 
@@ -151,6 +153,14 @@ void keyboardHandle(struct StackFrame *sf) {
 
 	if (dev[STD_IN].value < 0) { // with process blocked
 		// TODO: deal with blocked situation
+		dev[STD_IN].value ++;
+		pt=(ProcessTable *)(dev[STD_IN].pcb.prev);
+		pt = (ProcessTable*)((uint32_t)pt -(uint32_t)&(((ProcessTable*)0)->blocked));
+		pt->state = STATE_RUNNABLE;
+		pt->sleepTime = 0;
+
+		dev[STD_IN].pcb.prev = (dev[STD_IN].pcb.prev)->prev;
+		(dev[STD_IN].pcb.prev)->next = &(dev[STD_IN].pcb);
 	}
 
 	return;
@@ -179,6 +189,9 @@ void syscallHandle(struct StackFrame *sf) {
 		case SYS_SEM:
 			syscallSem(sf);
 			break; // for SYS_SEM
+		case SYS_PID:
+			syscallPid(sf);
+			break; // for SYS_PID
 		default:break;
 	}
 }
@@ -246,7 +259,73 @@ void syscallRead(struct StackFrame *sf) {
 }
 
 void syscallReadStdIn(struct StackFrame *sf) {
-	// TODO: complete `stdin`
+    // 判断标准输入设备的状态
+    if (dev[STD_IN].value < 0) 
+	{
+        // 如果设备未准备好，返回错误
+        pcb[current].regs.eax = -1;
+        return;
+    }
+    else if (dev[STD_IN].value == 0) 
+	{
+        // 如果没有待处理的数据，阻塞当前进程
+
+        // 减少设备的可用值，表示设备正在被使用
+        dev[STD_IN].value--;
+
+        // 将当前进程插入到设备等待队列中
+        pcb[current].blocked.next = dev[STD_IN].pcb.next;
+        pcb[current].blocked.prev = &(dev[STD_IN].pcb);
+        dev[STD_IN].pcb.next = &(pcb[current].blocked);
+        (pcb[current].blocked.next)->prev = &(pcb[current].blocked);
+
+        // 设置当前进程的状态为阻塞，并将睡眠时间设置为无限
+        pcb[current].state = STATE_BLOCKED;
+        pcb[current].sleepTime = -1; // 阻塞在STD_IN
+
+        // 触发调度器中断
+        asm volatile("int $0x20");
+
+        /* 当进程从阻塞状态恢复后执行以下代码 */
+
+        // 设置数据段选择子
+        int sel = sf->ds;
+        char *str = (char*)sf->edx; // 缓冲区指针
+        int size = sf->ebx; // 缓冲区大小
+        int i = 0; // 缓冲区当前位置
+        char character = 0; // 用于存放读取的字符
+        asm volatile("movw %0, %%es"::"m"(sel)); // 加载额外段寄存器
+
+        // 循环读取字符直到缓冲区几乎满
+        while(i < size-1) 
+		{
+            if(bufferHead != bufferTail) 
+			{
+                // 从键盘缓冲区读取一个字符
+                character = getChar(keyBuffer[bufferHead]);
+                bufferHead = (bufferHead + 1) % MAX_KEYBUFFER_SIZE;
+
+                // 显示字符（可能用于调试）
+                putChar(character);
+
+                if(character != 0) 
+				{
+                    // 将字符存储到用户提供的缓冲区中
+                    asm volatile("movb %0, %%es:(%1)"::"r"(character),"r"(str+i));
+                    i++;
+                }
+            }
+            else
+                break; // 如果键盘缓冲区为空，停止读取
+        }
+
+        // 在缓冲区末尾添加字符串终止符
+        asm volatile("movb $0x00, %%es:(%0)"::"r"(str+i));
+        
+        // 设置系统调用返回值为读取的字符数量
+        pcb[current].regs.eax = i;
+        return;
+    }
 }
 
 void syscallFork(struct StackFrame *sf) {
@@ -345,26 +424,95 @@ void syscallSem(struct StackFrame *sf) {
 	}
 }
 
+
+void syscallPid(struct StackFrame *sf) {
+	pcb[current].regs.eax = current;
+	return;
+}
 void syscallSemInit(struct StackFrame *sf) {
 	// TODO: complete `SemInit`
+	for(int i=0;i<MAX_SEM_NUM;i++)
+	{
+		if(sem[i].state==0)
+		{
+			sem[i].state=1;
+			sem[i].value=(int32_t)sf->edx;
+			sem[i].pcb.next=&(sem[i].pcb);
+			sem[i].pcb.prev=&(sem[i].pcb);
+			pcb[current].regs.eax=i;
+			return;
+		}
+	}
+	// 失败
+	pcb[current].regs.eax=-1;
 	return;
 }
 
 void syscallSemWait(struct StackFrame *sf) {
 	// TODO: complete `SemWait` and note that you need to consider some special situations
+	int i = sf->edx;
+	if (sem[i].state == 1)
+	{
+		pcb[current].regs.eax = 0;
+		sem[i].value--;
+		if (sem[i].value < 0)
+		{
+			pcb[current].blocked.next = sem[i].pcb.next;
+			pcb[current].blocked.prev = &(sem[i].pcb);
+			sem[i].pcb.next = &(pcb[current].blocked);
+			(pcb[current].blocked.next)->prev = &(pcb[current].blocked);
+			pcb[current].state = STATE_BLOCKED;
+			pcb[current].sleepTime = -1;
+			asm volatile("int $0x20");
+		}
+	}
+	else
+		pcb[current].regs.eax = -1;	
+	return;
 }
 
 void syscallSemPost(struct StackFrame *sf) {
 	int i = (int)sf->edx;
 	ProcessTable *pt = NULL;
-	if (i < 0 || i >= MAX_SEM_NUM) {
+	if (i < 0 || i >= MAX_SEM_NUM) 
+	{
 		pcb[current].regs.eax = -1;
 		return;
 	}
+
+	if (sem[i].state == 1) 
+	{
+		pcb[current].regs.eax = 0;
+		sem[i].value++;
+		if (sem[i].value <= 0) 
+		{
+			pt = (ProcessTable*)((uint32_t)(sem[i].pcb.prev) - (uint32_t)&(((ProcessTable*)0)->blocked));
+			pt->state = STATE_RUNNABLE;
+			pt->sleepTime = 0;
+			sem[i].pcb.prev = (sem[i].pcb.prev)->prev;
+			(sem[i].pcb.prev)->next = &(sem[i].pcb);
+		}
+	}
+	else if(sem[i].state==0)
+		pcb[current].regs.eax = -1;
+	return;
 	// TODO: complete other situations
+
 }
 
 void syscallSemDestroy(struct StackFrame *sf) {
 	// TODO: complete `SemDestroy`
+	struct Semaphore* p=&sem[sf->edx];
+	if(p->state==0)
+	{
+		pcb[current].regs.eax=-1;
+		return;
+	}
+	else if(p->state==1)
+	{
+		p->state=0;
+		pcb[current].regs.eax = 0;
+		asm volatile("int $0x20");
+	}
 	return;
 }

@@ -10,6 +10,7 @@
 #define SYS_SLEEP 4
 #define SYS_EXIT 5
 #define SYS_SEM 6
+#define SYS_PID 7
 
 #define STD_OUT 0
 #define STD_IN 1
@@ -26,6 +27,8 @@ int printf(const char *format,...);
 int scanf(const char *format,...);
 
 pid_t fork();
+pid_t getpid();
+
 
 int exec(void (*func)(void));
 
